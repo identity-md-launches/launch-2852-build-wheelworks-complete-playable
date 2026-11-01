@@ -15,6 +15,9 @@ export const MAX_DATA_AGE_MS = 2 * 60 * 60 * 1000;
 /** A chosen settlement must be within this window of generatedAt. */
 export const MAX_SETTLEMENT_AGE_MS = 26 * 60 * 60 * 1000;
 
+/** Accept at most one minute of clock skew; never accept arbitrary future data. */
+export const CLOCK_TOLERANCE_MS = 60_000;
+
 const N: Dir = 0;
 const E: Dir = 1;
 const S: Dir = 2;
@@ -196,6 +199,10 @@ function decStr(v: unknown, max: number): number | null {
 
 function isoTime(v: unknown): number | null {
   if (typeof v !== "string" || v.length > 40) return null;
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.exec(v);
+  if (!match || Number(match[2]) > 23 || Number(match[3]) > 59 || Number(match[4]) > 59) return null;
+  const calendar = Date.parse(`${match[1]}T00:00:00Z`);
+  if (!Number.isFinite(calendar) || new Date(calendar).toISOString().slice(0, 10) !== match[1]) return null;
   const t = Date.parse(v);
   return Number.isFinite(t) ? t : null;
 }
@@ -242,17 +249,41 @@ export function parseSettlements(body: unknown): ParseResult {
 
 export type PickResult = { ok: true; settlement: Settlement } | { ok: false; reason: string };
 
-/** Most recent settlement that is marked safe and sits at or below the safe block. */
+/** All timestamps are rechecked at use time, including cached snapshots. */
+export function snapshotFresh(snap: ChainSnapshot, now: number): boolean {
+  const gen = isoTime(snap.generatedAt);
+  return gen !== null && Number.isFinite(now) && gen <= now + CLOCK_TOLERANCE_MS && now - gen <= MAX_DATA_AGE_MS
+    && snap.chainId === SEPOLIA_CHAIN_ID && snap.network === "Sepolia";
+}
+
+export function safeSettlement(snap: ChainSnapshot, s: Settlement, now: number): boolean {
+  const gen = isoTime(snap.generatedAt), ts = isoTime(s.blockTimestamp);
+  return gen !== null && ts !== null && snapshotFresh(snap, now) && ts <= now + CLOCK_TOLERANCE_MS
+    && ts <= gen + CLOCK_TOLERANCE_MS && gen - ts <= MAX_SETTLEMENT_AGE_MS
+    && now - ts <= MAX_SETTLEMENT_AGE_MS && SAFE_STATUSES.has(s.confirmationStatus)
+    && s.ethereumBlockNumber <= snap.safeThroughBlock;
+}
+
 export function pickSettlement(snap: ChainSnapshot, now: number): PickResult {
-  const gen = Date.parse(snap.generatedAt);
-  if (now - gen > MAX_DATA_AGE_MS) return { ok: false, reason: "The settlement feed is stale (generated over two hours ago)." };
-  const safe = snap.settlements
-    .filter((s) => SAFE_STATUSES.has(s.confirmationStatus))
-    .filter((s) => s.ethereumBlockNumber <= snap.safeThroughBlock)
-    .filter((s) => gen - Date.parse(s.blockTimestamp) <= MAX_SETTLEMENT_AGE_MS)
+  if (!snapshotFresh(snap, now)) return { ok: false, reason: "The feed timestamp is stale, future-dated or invalid, or the network is not Sepolia." };
+  const safe = snap.settlements.filter((s) => safeSettlement(snap, s, now))
     .sort((a, b) => b.ethereumBlockNumber - a.ethereumBlockNumber || a.transactionHash.localeCompare(b.transactionHash));
-  if (safe.length === 0) return { ok: false, reason: "No safe settlement was found in the last 24 hours." };
+  if (!safe.length) return { ok: false, reason: "No recent safe settlement with a valid timestamp is available." };
   return { ok: true, settlement: safe[0] };
+}
+
+/** v1 chain share links are exclusively Sepolia (11155111), never arbitrary networks. */
+export function settlementMatches(snap: ChainSnapshot, claimed: Settlement, now: number): boolean {
+  return snap.chainId === SEPOLIA_CHAIN_ID && snap.network === "Sepolia" && snap.settlements.some((s) =>
+    safeSettlement(snap, s, now) && s.transactionHash.toLowerCase() === claimed.transactionHash.toLowerCase()
+    && s.workAdded === claimed.workAdded && s.settledThroughRound === claimed.settledThroughRound
+    && s.ethereumBlockNumber === claimed.ethereumBlockNumber);
+}
+
+export function recheckFeed(feed: FeedState, now: number): FeedState {
+  if (feed.status !== "ready") return feed;
+  const picked = pickSettlement(feed.snapshot, now);
+  return picked.ok ? { ...feed, settlement: picked.settlement } : { status: "unavailable", reason: picked.reason };
 }
 
 export interface Challenge {

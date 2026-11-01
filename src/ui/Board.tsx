@@ -52,7 +52,8 @@ export interface BoardProps {
 }
 
 export function Board(props: BoardProps) {
-  const { level, layout, sim, focus } = props;
+  const { level, layout, sim } = props;
+  const focus = { x: Math.min(level.w - 1, Math.max(0, props.focus.x)), y: Math.min(level.h - 1, Math.max(0, props.focus.y)) };
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
   const wantFocus = useRef(false);
 
@@ -116,7 +117,7 @@ export function Board(props: BoardProps) {
   }
 
   return (
-    <div className="board-frame">
+    <div className={`board-frame board-${sim.outcome}`}>
       <div
         className="board"
         role="group"

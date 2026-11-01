@@ -21,7 +21,7 @@ export const defaultSave = (): SaveData => ({
   solved: {},
   layouts: {},
   lastLevel: "tutorial",
-  settings: { muted: false, motion: "system" },
+  settings: { muted: true, motion: "system" },
 });
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -68,10 +68,24 @@ export function loadSave(storage: Pick<Storage, "getItem"> | null): SaveData {
   }
 }
 
-export function writeSave(storage: Pick<Storage, "setItem"> | null, data: SaveData) {
+export function writeSave(storage: Pick<Storage, "setItem"> | null, data: SaveData): boolean {
   try {
-    storage?.setItem(SAVE_KEY, JSON.stringify(data));
+    if (!storage) return false;
+    storage.setItem(SAVE_KEY, JSON.stringify(data));
+    return true;
   } catch {
-    /* storage full or blocked: progress simply is not kept */
+    return false;
+  }
+}
+
+/** Accessing localStorage itself can throw. Never overwrite a save we could not read. */
+export function readBrowserSave(host: Pick<Window, "localStorage">): { storage: Storage | null; save: SaveData; available: boolean } {
+  try {
+    const storage = host.localStorage;
+    const raw = storage.getItem(SAVE_KEY);
+    const save = !raw || raw.length > 50_000 ? defaultSave() : validateSave(JSON.parse(raw));
+    return { storage, save, available: true };
+  } catch {
+    return { storage: null, save: defaultSave(), available: false };
   }
 }

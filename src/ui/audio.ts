@@ -9,7 +9,7 @@ function context(): AudioContext | null {
   const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
   if (!Ctor) return null;
   if (!ctx) ctx = new Ctor();
-  if (ctx.state === "suspended") void ctx.resume();
+  if (ctx.state === "suspended") void ctx.resume().catch(audioFailed);
   return ctx;
 }
 
@@ -26,7 +26,12 @@ function tone(ac: AudioContext, freq: number, start: number, dur: number, type: 
   osc.stop(ac.currentTime + start + dur + 0.02);
 }
 
+function audioFailed() {
+  window.dispatchEvent(new Event("wheelworks-audio-unavailable"));
+}
+
 export function play(cue: Cue, muted: boolean) {
+  try {
   if (muted) return;
   const ac = context();
   if (!ac) return;
@@ -52,4 +57,5 @@ export function play(cue: Cue, muted: boolean) {
       tone(ac, 147, 0.12, 0.3, "sawtooth", 0.05);
       break;
   }
+  } catch { audioFailed(); }
 }

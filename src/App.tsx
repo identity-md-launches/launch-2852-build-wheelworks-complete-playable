@@ -14,9 +14,9 @@ import {
   type Placement,
   type SimState,
 } from "./game/sim";
-import { challengeFromSettlement, explorerUrl, loadFeed, offlineChallenge, type Challenge, type FeedState } from "./game/challenge";
+import { challengeFromSettlement, explorerUrl, loadFeed, offlineChallenge, recheckFeed, settlementMatches, type Challenge, type FeedState } from "./game/challenge";
 import { SHARE_PREFIX, encodeChallengeShare, encodeLevelShare, readShareFromHash } from "./game/share";
-import { loadSave, writeSave, type MotionPref, type SaveData } from "./game/storage";
+import { readBrowserSave, writeSave, type MotionPref, type SaveData } from "./game/storage";
 import { Board } from "./ui/Board";
 import { CheckIcon, CrossIcon, HamsterMark, PieceIcon } from "./ui/art";
 import { play } from "./ui/audio";
@@ -27,7 +27,7 @@ type Mode = "levels" | "challenge";
 const TICK_MS = 480;
 const FEED_POLL_MS = 60_000;
 const TOOL_LABEL: Record<Tool, string> = { straight: "Straight", elbow: "Elbow", alternator: "Alternator", remove: "Remove" };
-const storage = typeof window !== "undefined" ? window.localStorage : null;
+
 
 function useSystemReducedMotion() {
   const [reduce, setReduce] = useState(() => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
@@ -36,16 +36,19 @@ function useSystemReducedMotion() {
     if (!mq) return;
     const on = () => setReduce(mq.matches);
     mq.addEventListener("change", on);
+    on(); // Synchronize if the preference changed between render and subscription.
     return () => mq.removeEventListener("change", on);
   }, []);
   return reduce;
 }
 
-const shortHash = (h: string) => `${h.slice(0, 8)}…${h.slice(-6)}`;
 const fmt = (n: number) => n.toLocaleString("en-US");
 
 export default function App() {
-  const [save, setSave] = useState<SaveData>(() => loadSave(storage));
+  const [saved] = useState(() => readBrowserSave(window));
+  const [save, setSave] = useState<SaveData>(saved.save);
+  const [saveWarning, setSaveWarning] = useState(!saved.available);
+  const [audioWarning, setAudioWarning] = useState(false);
   const [mode, setMode] = useState<Mode>("levels");
   const [levelId, setLevelId] = useState(save.lastLevel);
   const [challenge, setChallenge] = useState<Challenge | null>(null);
@@ -59,6 +62,8 @@ export default function App() {
   const [notice, setNotice] = useState<string>("");
   const [shareText, setShareText] = useState("");
   const [linkError, setLinkError] = useState("");
+  const [nextRetry, setNextRetry] = useState(Date.now() + FEED_POLL_MS);
+  const [clock, setClock] = useState(Date.now());
   const [feed, setFeed] = useState<FeedState>({ status: "loading" });
   const systemReduce = useSystemReducedMotion();
   const reducedMotion = save.settings.motion === "reduce" || (save.settings.motion === "system" && systemReduce);
@@ -68,50 +73,68 @@ export default function App() {
   const layout: Layout = useMemo(() => layoutFrom([...level.fixed, ...placements]), [level, placements]);
   const used = usedCounts(layout);
 
-  useEffect(() => writeSave(storage, save), [save]);
-
-  /* ----- open a share link (once, on load) ----- */
-  const openedLink = useRef(false);
+  useEffect(() => { if (!writeSave(saved.storage, save)) setSaveWarning(true); }, [save, saved]);
   useEffect(() => {
-    if (openedLink.current) return;
-    openedLink.current = true;
-    const parsed = readShareFromHash(window.location.hash);
-    if (!parsed) return;
-    if (!parsed.ok) {
-      setLinkError(`That share link could not be opened: ${parsed.reason}`);
-      return;
-    }
-    const v = parsed.value;
-    if (v.kind === "level") {
-      setMode("levels");
-      setLevelId(v.level.id);
-      setPlacements(v.placements);
-      setSim(initialState(v.level));
-    } else {
-      setMode("challenge");
-      setChallenge(v.challenge);
-      challengePieces.current = v.placements;
-      setPlacements(v.placements);
-      setSim(initialState(v.challenge.level));
-    }
-    setNotice("Opened a shared board. A share link only rebuilds the board; it does not show that anyone solved it.");
+    const onAudioError = () => setAudioWarning(true);
+    window.addEventListener("wheelworks-audio-unavailable", onAudioError);
+    return () => window.removeEventListener("wheelworks-audio-unavailable", onAudioError);
+  }, []);
+  const sessions = useRef<Record<string, { placements: Placement[]; sim: SimState }>>({});
+  const keepSession = () => { sessions.current[mode === "challenge" ? "challenge" : levelId] = { placements, sim: simRef.current }; };
+  const resumeSession = (key: string, l: Level, fallback: Placement[]) => {
+    const previous = sessions.current[key];
+    setPlacements(previous?.placements ?? fallback);
+    const state = previous?.sim ?? initialState(l);
+    simRef.current = state;
+    setSim(state);
+    setRunning(false);
+    setFocus({ x: 0, y: 0 });
+  };
+
+  /* Hash navigation is supported without a reload. Invalid links leave the run intact. */
+  useEffect(() => {
+    const open = () => {
+      const parsed = readShareFromHash(window.location.hash);
+      if (!parsed) return;
+      if (!parsed.ok) { setLinkError(`That share link could not be opened: ${parsed.reason}`); return; }
+      const v = parsed.value;
+      setLinkError(""); setRunning(false); setTool(null); setToolRot({ straight: 0, elbow: 0, alternator: 0 });
+      setFocus({ x: 0, y: 0 }); setShareText("");
+      const l = v.kind === "level" ? v.level : v.challenge.level;
+      const state = initialState(l);
+      if (v.kind === "level") { setMode("levels"); setLevelId(l.id); }
+      else { setMode("challenge"); setChallenge(v.challenge); challengePieces.current = v.placements; }
+      setPlacements(v.placements); setSim(state); simRef.current = state;
+      setNotice("Shared board loaded at tick 0. A link reproduces a layout, never a claimed solve.");
+    };
+    open();
+    window.addEventListener("hashchange", open);
+    return () => window.removeEventListener("hashchange", open);
   }, []);
 
-  /* ----- live settlement feed (never touches an active challenge) ----- */
-  useEffect(() => {
-    let alive = true;
-    const pull = async () => {
-      if (document.visibilityState === "hidden") return;
-      const st = await loadFeed(window.fetch.bind(window), () => Date.now());
-      if (alive) setFeed(st);
-    };
-    void pull();
-    const id = window.setInterval(pull, FEED_POLL_MS);
-    return () => {
-      alive = false;
-      window.clearInterval(id);
-    };
+  const requestId = useRef(0);
+  const retryTimer = useRef<ReturnType<typeof setTimeout>>();
+  const refreshFeed = useCallback(async () => {
+    const id = ++requestId.current;
+    clearTimeout(retryTimer.current);
+    setFeed((f) => recheckFeed(f, Date.now()));
+    setNextRetry(Date.now() + FEED_POLL_MS);
+    const result = await loadFeed(window.fetch.bind(window), () => Date.now());
+    if (id === requestId.current) {
+      setFeed(result); setNextRetry(Date.now() + FEED_POLL_MS);
+      retryTimer.current = setTimeout(() => { if (document.visibilityState !== "hidden") void refreshFeed(); }, FEED_POLL_MS);
+    }
   }, []);
+  useEffect(() => {
+    void refreshFeed();
+    const visible = () => {
+      if (document.visibilityState !== "hidden") { setClock(Date.now()); void refreshFeed(); }
+    };
+    document.addEventListener("visibilitychange", visible);
+    const clockId = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => { requestId.current++; clearTimeout(retryTimer.current); clearInterval(clockId); document.removeEventListener("visibilitychange", visible); };
+  }, [refreshFeed]);
+  const currentFeed = recheckFeed(feed, clock);
 
   /* ----- simulation clock: fixed tick length, one step per tick ----- */
   const simRef = useRef(sim);
@@ -217,21 +240,29 @@ export default function App() {
   };
 
   const openLevel = (id: string) => {
+    if (mode === "levels" && id === levelId) return;
+    keepSession();
     const l = levelById(id)!;
     clearHash();
     setMode("levels");
     setLevelId(id);
-    setPlacements(save.layouts[id] ?? []);
-    setRunning(false);
-    setSim(initialState(l));
+    resumeSession(id, l, save.layouts[id] ?? []);
     setFocus({ x: 0, y: 0 });
     setTool(null);
+    setToolRot({ straight: 0, elbow: 0, alternator: 0 });
     setNotice("");
     setShareText("");
     setSave((s) => ({ ...s, lastLevel: id }));
   };
 
-  const startChallenge = (c: Challenge) => {
+  const startChallenge = (requested: Challenge) => {
+    keepSession();
+    const checked = recheckFeed(feed, Date.now());
+    setFeed(checked);
+    const c = requested.kind === "chain"
+      ? checked.status === "ready" ? challengeFromSettlement(checked.settlement) : offlineChallenge()
+      : requested;
+    if (checked.status !== "ready" && requested.kind === "chain") void refreshFeed();
     clearHash();
     setChallenge(c);
     setTool(null);
@@ -239,19 +270,22 @@ export default function App() {
     challengePieces.current = [];
     setPlacements([]);
     setRunning(false);
-    setSim(initialState(c.level));
+    const state = initialState(c.level);
+    setSim(state); simRef.current = state;
+    delete sessions.current.challenge;
     setFocus({ x: 0, y: 0 });
     setShareText("");
-    setNotice(c.kind === "chain" ? "Challenge locked to this settlement. Feed updates will not change it." : "Offline workshop challenge loaded.");
+    setNotice("");
   };
 
   const showChallengeTab = () => {
-    setRunning(false);
-    setMode("challenge");
-    setShareText("");
-    if (challenge) {
-      setPlacements(challengePieces.current);
-      setSim(initialState(challenge.level));
+    if (mode === "challenge") return;
+    keepSession(); clearHash();
+    setRunning(false); setMode("challenge"); setTool(null); setShareText(""); setNotice("");
+    if (challenge) resumeSession("challenge", challenge.level, challengePieces.current);
+    else {
+      const checked = recheckFeed(feed, Date.now());
+      startChallenge(checked.status === "ready" ? challengeFromSettlement(checked.settlement) : offlineChallenge());
     }
   };
 
@@ -289,15 +323,16 @@ export default function App() {
   const coach = level.id === "tutorial" && mode === "levels" ? tutorialSteps(tool, placements, sim) : null;
 
   return (
-    <div className="app">
+    <div className="app" data-motion={reducedMotion ? "reduce" : "full"}>
+      <a className="skip-link" href="#main">Skip to workbench</a>
       <header className="topbar">
         <div className="brand">
           <HamsterMark size={36} spin={running && !reducedMotion} />
-          <span className="brand-name">Wheelworks</span>
+          <div><span className="brand-name">Wheelworks</span><span className="brand-note">A hamster-powered routing puzzle</span></div>
         </div>
         <div className="settings">
-          <button type="button" className="btn btn-quiet" onClick={() => setSetting({ muted: !muted })}>
-            {muted ? "Unmute sound" : "Mute sound"}
+          <button type="button" className="btn btn-quiet" aria-pressed={!muted} onClick={() => setSetting({ muted: !muted })}>
+            {muted ? "Sound off" : "Sound on"}
           </button>
         </div>
       </header>
@@ -306,15 +341,17 @@ export default function App() {
         <h1 className="sr-only">Wheelworks, a hamster-powered routing puzzle</h1>
         <nav className="modes" aria-label="Game mode">
           <button type="button" className={`tab${mode === "levels" ? " tab-on" : ""}`} aria-current={mode === "levels" ? "page" : undefined} onClick={() => {
-              if (mode !== "levels") openLevel(save.lastLevel);
+              if (mode !== "levels") openLevel(levelId);
             }}>
-            Workshop levels
+            Workshop
           </button>
           <button type="button" className={`tab${mode === "challenge" ? " tab-on" : ""}`} aria-current={mode === "challenge" ? "page" : undefined} onClick={showChallengeTab}>
-            Squeekchain challenge
+            Chain challenge
           </button>
         </nav>
 
+        {saveWarning && <p className="banner banner-warn" role="status">Saves unavailable. Play continues in memory; progress and settings will be lost when this page closes. Existing saves are kept.</p>}
+        {audioWarning && <p className="banner banner-warn" role="status">Sound unavailable. The machine and progress still work.</p>}
         {linkError && (
           <p className="banner banner-bad" role="alert">
             {linkError}
@@ -345,13 +382,13 @@ export default function App() {
         )}
 
         {mode === "challenge" && (
-          <ChallengePanel feed={feed} challenge={challenge} onStart={startChallenge} />
+          <ChallengePanel feed={currentFeed} challenge={challenge} onStart={startChallenge} onRetry={() => void refreshFeed()} nextRetry={nextRetry} now={clock} />
         )}
 
         {(mode === "levels" || challenge) && (
-          <div className="play">
+          <div className={`play play-${mode}`}>
               <section className="level-head" aria-labelledby="level-title">
-                <h2 id="level-title">{mode === "challenge" ? `Challenge: ${level.name}` : level.name}</h2>
+                <div className="title-row"><h2 id="level-title">{level.name}</h2><span className="level-number">{mode === "levels" ? levelIndex === 0 ? "Tutorial" : `${levelIndex} / 6` : `${level.source.supply} pulses`}</span></div>
                 <p className="goal">{level.goal}</p>
               <ul className="targets" aria-label="Device quotas">
                 {level.targets.map((t) => {
@@ -371,6 +408,8 @@ export default function App() {
               </section>
 
               <div className="board-wrap">
+              <div className="board-caption"><span>Route every spark</span><span>{level.w} × {level.h} workshop</span></div>
+              {coach && <p className="coach-current" role="status">{coach.find((s) => !s.done)?.text ?? "Beautiful work. Your first machine is running."}</p>}
 
               <Board
                 level={level}
@@ -389,6 +428,40 @@ export default function App() {
               />
               </div>
 
+              <section className="tray" aria-labelledby="tray-title">
+                <h3 id="tray-title">Parts tray <span>{tool ? `${TOOL_LABEL[tool]} selected` : "Choose a part"}</span></h3>
+                <div className={`tools tools-${Object.values(level.inventory).filter((n) => n > 0).length}`} role="group" aria-label="Choose a tool">
+                  {(["straight", "elbow", "alternator"] as PieceKind[]).filter((k) => level.inventory[k] > 0).map((k) => {
+                    const left = level.inventory[k] - used[k];
+                    return (
+                      <button
+                        key={k}
+                        type="button"
+                        aria-label={`${TOOL_LABEL[k]}, ${left} of ${level.inventory[k]} left, next orientation ${toolRot[k] * 90} degrees`}
+                        aria-pressed={tool === k}
+                        className={`tool${tool === k ? " tool-on" : ""}`}
+                        onClick={() => setTool(k)}
+                      >
+                        <span className="tool-icon">
+                          <PieceIcon kind={k} rot={toolRot[k]} />
+                        </span>
+                        <span className="tool-name">{TOOL_LABEL[k]}</span>
+                        <span className="tool-count">
+                          {left}/{level.inventory[k]} left
+                        </span>
+                      </button>
+                    );
+                  })}
+                  <button type="button" aria-pressed={tool === "remove"} className={`tool tool-remove${tool === "remove" ? " tool-on" : ""}`} onClick={() => setTool("remove")}>
+                    <span className="tool-icon tool-x">
+                      <CrossIcon />
+                    </span>
+                    <span className="tool-name">Remove</span>
+                    <span className="tool-count">Return part</span>
+                  </button>
+                </div>
+                <p className="hint-line">{tool === "remove" ? "Tap a placed part to return it to the tray." : "Tap to place · tap again to rotate. Preview shows the next part."}</p>
+              </section>
               <section className="run" aria-label="Machine controls">
               <div className="controls">
                 <button
@@ -403,6 +476,7 @@ export default function App() {
                     }
                   }}
                 >
+                  <span className="play-icon" aria-hidden="true">{running ? "Ⅱ" : "▶"}</span>
                   {running ? "Pause" : sim.tick > 0 && sim.outcome === "running" ? "Resume" : "Start"}
                 </button>
                 <button type="button" className="btn" disabled={running || sim.outcome !== "running"} onClick={doStep}>
@@ -430,45 +504,14 @@ export default function App() {
                   )}
                   {sim.outcome === "won" && mode === "levels" && !nextLevel && (
                     <button type="button" className="btn btn-primary" onClick={showChallengeTab}>
-                      Try the Squeekchain challenge
+                      Try the Chain challenge
                     </button>
                   )}
                 </div>
               )}
               </section>
 
-              <section className="tray" aria-labelledby="tray-title">
-                <h3 id="tray-title" className="sr-only">Parts tray</h3>
-                <p className="hint-line">Pick a part, then tap a floor tile. Tap a placed part to rotate it.</p>
-                <div className="tools" role="group" aria-label="Choose a tool">
-                  {(["straight", "elbow", "alternator"] as PieceKind[]).filter((k) => level.inventory[k] > 0).map((k) => {
-                    const left = level.inventory[k] - used[k];
-                    return (
-                      <button
-                        key={k}
-                        type="button"
-                        aria-pressed={tool === k}
-                        className={`tool${tool === k ? " tool-on" : ""}`}
-                        onClick={() => setTool(k)}
-                      >
-                        <span className="tool-icon">
-                          <PieceIcon kind={k} />
-                        </span>
-                        <span className="tool-name">{TOOL_LABEL[k]}</span>
-                        <span className="tool-count">
-                          {left} of {level.inventory[k]} left
-                        </span>
-                      </button>
-                    );
-                  })}
-                  <button type="button" aria-pressed={tool === "remove"} className={`tool${tool === "remove" ? " tool-on" : ""}`} onClick={() => setTool("remove")}>
-                    <span className="tool-icon tool-x">
-                      <CrossIcon />
-                    </span>
-                    <span className="tool-name">Remove</span>
-                    <span className="tool-count">Take a part back</span>
-                  </button>
-                </div>
+              <section className="layout-actions" aria-label="Layout actions">
                 <div className="tray-actions">
                   <button type="button" className="btn btn-quiet" disabled={placements.length === 0} onClick={() => commit([])}>
                     Clear all parts
@@ -546,7 +589,7 @@ export default function App() {
       </main>
       <footer className="foot">
         <p>
-          Wheelworks is a fan-made puzzle for the Squeekchain community. Energy pulses are fictional. Progress stays in this browser.
+          Wheelworks is a fan-made puzzle for the Squeekchain community. Energy pulses are fictional. Saves stay in this browser when storage is available.
         </p>
       </footer>
     </div>
@@ -559,81 +602,49 @@ function tutorialSteps(tool: Tool | null, placements: Placement[], sim: SimState
   const flat = (p?: Placement) => !!p && p.kind === "straight" && p.rot % 2 === 1;
   return [
     { text: "Pick Straight in the parts tray.", done: tool === "straight" || placements.length > 0 },
-    { text: "Tap the dashed tile next to the wheel to place a straight.", done: !!a || !!b },
-    { text: "Tap that straight again to rotate it so the track runs left to right.", done: flat(a) || flat(b) },
-    { text: "Fill the second dashed tile the same way.", done: flat(a) && flat(b) },
+    { text: "Tap the dashed tile next to the wheel to place a straight.", done: !!a },
+    { text: "Tap that straight again to rotate it so the track runs left to right.", done: flat(a) },
+    { text: "Tap the second dashed tile once. It remembers the horizontal rotation; one tap is enough.", done: flat(a) && flat(b) },
     { text: "Press Start, then watch the pulse travel. Pause and Step work at any time.", done: sim.tick > 0 },
     { text: "Deliver the pulse to the grater to finish.", done: sim.outcome === "won" },
   ];
 }
 
-function ChallengePanel({ feed, challenge, onStart }: { feed: FeedState; challenge: Challenge | null; onStart: (c: Challenge) => void }) {
+function ChallengePanel({ feed, challenge, onStart, onRetry, nextRetry, now }: {
+  feed: FeedState; challenge: Challenge | null; onStart: (c: Challenge) => void;
+  onRetry: () => void; nextRetry: number; now: number;
+}) {
   const active = challenge?.settlement;
   const latest = feed.status === "ready" ? feed.settlement : null;
-  const newer = latest && challenge?.kind === "chain" && active && latest.transactionHash !== active.transactionHash;
-  const linkMatches = challenge?.fromLink && feed.status === "ready" && feed.snapshot.settlements.some((s) => s.transactionHash === active?.transactionHash && s.workAdded === active?.workAdded);
-
+  const matches = !!active && feed.status === "ready" && settlementMatches(feed.snapshot, active, now);
+  const newer = latest && (!active || latest.transactionHash !== active.transactionHash);
+  const offline = challenge?.kind === "offline" || (!challenge && feed.status !== "ready");
+  const verified = challenge?.fromLink ? matches : !!active;
   return (
-    <section className="chain" aria-labelledby="chain-title">
-      <h2 id="chain-title" className="chain-title">
-        A board picked by a real Squeekchain settlement
-      </h2>
-      <p className="fine">
-        Pulses in the workshop are fictional. The settlement is real Sepolia testnet data: its transaction hash picks the board and its work added picks the energy tier.
-      </p>
-
-      {challenge && (
-        <div className="source-card" aria-label="Active challenge source">
-          {challenge.kind === "chain" && active ? (
-            <>
-              <p>
-                <strong>Playing round {fmt(active.settledThroughRound)}</strong>, {challenge.tier.name.toLowerCase()} ({challenge.tier.supply} pulses) from {fmt(active.workAdded)} chain work units.
-              </p>
-              <p className="mono-line">
-                Seed tx {shortHash(active.transactionHash)}
-                {active.ethereumBlockNumber > 0 && <> in Sepolia block {fmt(active.ethereumBlockNumber)}</>}.{" "}
-                {explorerUrl(active.transactionHash) && (
-                  <a href={explorerUrl(active.transactionHash)!} target="_blank" rel="noopener noreferrer">
-                    View the transaction on Sepolia Etherscan
-                  </a>
-                )}
-              </p>
-              {challenge.fromLink && (
-                <p className="fine">{linkMatches ? "Opened from a share link. It matches a settlement in the live feed." : "Opened from a share link. Not re-checked against the live feed; use the explorer link to verify it."}</p>
-              )}
-            </>
-          ) : (
-            <p>
-              <strong>Offline workshop challenge.</strong> An authored board, not linked to any transaction or chain data.
-            </p>
-          )}
-        </div>
-      )}
-
-      {feed.status === "loading" && <p className="fine">Reading the public settlement feed…</p>}
-      {feed.status === "ready" && latest && (!challenge || newer || challenge.kind === "offline") && (
-        <div className="source-card">
-          <p>
-            Latest safe settlement: round {fmt(latest.settledThroughRound)}, {fmt(latest.workAdded)} work units, tx {shortHash(latest.transactionHash)}.
-          </p>
-          {newer && <p className="fine">Your current run stays on round {fmt(active!.settledThroughRound)} until you switch.</p>}
-          <button type="button" className="btn btn-primary" onClick={() => onStart(challengeFromSettlement(latest))}>
-            {challenge ? `Switch to round ${fmt(latest.settledThroughRound)}` : `Start round ${fmt(latest.settledThroughRound)} challenge`}
-          </button>
-        </div>
-      )}
-      {feed.status === "unavailable" && (!challenge || challenge.kind === "offline") && (
-        <div className="source-card">
-          <p>
-            <strong>No live settlement.</strong> {feed.reason}
-          </p>
-          {!challenge && (
-            <button type="button" className="btn btn-primary" onClick={() => onStart(offlineChallenge())}>
-              Play the offline workshop challenge
-            </button>
-          )}
-        </div>
-      )}
+    <section className="chain" aria-label="Challenge source">
+      <div className="chain-summary">
+        <span className={`feed-dot ${matches ? "feed-good" : ""}`} aria-hidden="true" />
+        <h2 className="chain-title">{offline ? "Offline workshop challenge—authored, not chain-derived" : active ? `Sepolia · ${verified ? "round" : "unverified round"} ${fmt(active.settledThroughRound)} · ${challenge!.tier.name}` : "Sepolia challenge"}</h2>
+      </div>
+      {!verified && active && <p className="unverified">Unverified share data. Round, block and work are claims from the link.</p>}
+      <details className="provenance">
+        <summary>Source & energy details</summary>
+        <p>Pulses are fictional workshop energy. No tokens, rewards or mainnet minting.</p>
+        {active ? <>
+          <p>{challenge?.fromLink ? matches ? "All fields match a recent safe settlement in the live feed, including the Sepolia network." : "This link does not match all fields of a recent safe feed settlement." : "Validated as a safe Sepolia settlement when loaded. This run stays frozen even if the feed expires."}</p>
+          <dl><div><dt>{verified ? "Round" : "Claimed round"}</dt><dd>{fmt(active.settledThroughRound)}</dd></div>
+          <div><dt>{verified ? "Sepolia block" : "Claimed Sepolia block"}</dt><dd>{fmt(active.ethereumBlockNumber)}</dd></div>
+          <div><dt>{verified ? "Work units" : "Claimed work units"}</dt><dd>{fmt(active.workAdded)}</dd></div>
+          <div><dt>Network</dt><dd>Sepolia · 11155111 (fixed by link format)</dd></div>
+          <div><dt>Seed transaction</dt><dd className="seed-hash">{active.transactionHash}</dd></div></dl>
+          <p>{challenge!.tier.supply} pulses · {challenge!.tier.name}. Hash picks the board; work picks the tier.</p>
+          <a href={explorerUrl(active.transactionHash)!} target="_blank" rel="noopener noreferrer">View transaction on Sepolia Etherscan ↗</a>
+        </> : <p>An authored board, not linked to a transaction. A safe feed enables a new chain challenge.</p>}
+      </details>
+      {feed.status === "loading" && <p className="fine">Reading settlement feed. The offline workshop is ready to play.</p>}
+      {feed.status === "unavailable" && <div className="feed-retry"><p className="fine">{feed.reason} Automatic retry in {Math.min(60, Math.max(0, Math.ceil((nextRetry - now) / 1000)))}s.</p><button type="button" className="btn btn-quiet" onClick={onRetry}>Retry now</button></div>}
+      {latest && (!challenge || newer) && <div className="feed-retry"><p className="fine">Safe Sepolia round {fmt(latest.settledThroughRound)} available. Current board stays frozen.</p><button type="button" className="btn" onClick={() => onStart(challengeFromSettlement(latest))}>{challenge ? "Load latest round" : "Load chain challenge"}</button></div>}
+      {!challenge && <button type="button" className="btn" onClick={() => onStart(offlineChallenge())}>Play offline workshop</button>}
     </section>
   );
 }

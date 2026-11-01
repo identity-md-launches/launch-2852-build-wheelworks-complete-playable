@@ -1,143 +1,153 @@
 # Wheelworks
 
-A hamster-powered 2D routing puzzle for the Squeekchain community. Place and rotate a limited
-supply of straight conveyors, elbows and alternators so that energy pulses from a fixed hamster
-wheel reach every workshop device's quota within the tick budget.
+A complete hamster-powered routing puzzle: place limited straight, elbow and alternator tracks,
+then deliver every device's pulse quota within its tick budget. Original SVG art, deterministic
+simulation, tutorial, six levels, chain-seeded challenges and local progress. React / TypeScript /
+SVG / CSS. No account, wallet, payment, token, leaderboard, runtime AI or backend.
 
-- Seven handcrafted boards: a tutorial ("First spark") and six levels that teach straight routes,
-  then turning, then alternation, then two goals with order-sensitive splitting.
-- A Squeekchain challenge: a real, safe Sepolia settlement from the public feed picks one of three
-  pretested boards (by `transactionHash`) and an energy tier (by `workAdded`). If the feed is
-  unreachable, stale, empty or has no safe settlement, an explicitly labelled offline challenge is
-  offered instead.
-- No wallet, tokens, contracts, backend, accounts, leaderboard or runtime AI.
+**Public site:** https://wheelworks-a-hamster-powered-rou.imd.site/
 
-## Delivery
+This revision supplies the source and complete static export in `dist/` for the existing site's
+publisher. The HTTPS site was reachable and its previous version was played during this task.
+The revised export has been checked locally; publication of this revision and a subsequent
+same-URL verification have not occurred inside this run. See [TEST_REPORT.md](TEST_REPORT.md)
+for actual evidence, open delivery limits and browser availability.
 
-| Item | Where |
-| --- | --- |
-| Static export (served as-is, relative URLs) | `dist/` (`dist/index.html`, `dist/assets/`, `dist/og.png`, `dist/favicon.svg`) |
-| Source | `src/` (game logic in `src/game/`, UI in `src/ui/` and `src/App.tsx`) |
-| Automated tests | `tests/` |
-| Design system | `DESIGN.md` |
-| Asset licences and provenance | `ASSETS.md` |
-| Test and review report | `TEST_REPORT.md` |
+## Install, preview and rebuild
 
-**Public URL.** Hosting is not done from this repository: the IMD publisher pins the committed
-`dist/` export to IPFS after the job completes and names it then. This worker cannot know or claim
-that URL. The export uses `base: "./"` and hash-only state, so it works at any gateway subpath.
-
-## Install, run, rebuild
-
-Requires Node 18+ (checked with Node 24.21 and npm 11.19).
+Use Node 18+ and npm. From the repository root:
 
 ```sh
-npm ci            # install exact versions from package-lock.json
-npm run dev       # local dev server with hot reload
-npm test          # vitest: simulation, every reference solution, share links, save data, API parsing
-npm run typecheck # tsc --noEmit
-npm run build     # typecheck + production build into dist/
-npm run preview   # serve dist/ locally to check the export
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm run preview -- --host 127.0.0.1
+npm audit --omit=dev
+npm audit
 ```
 
-After any source change run `npm run build` and commit the regenerated `dist/` alongside the source.
+`npm run dev` runs the development server. `npm run preview` serves the production export;
+open the URL it prints. The build performs its own typecheck and generates `dist/index.html`,
+`dist/assets/*`, `dist/favicon.svg` and `dist/og.png`. Commit the rebuilt export with source.
+No generated dependencies or browser binaries are part of the delivery. The manifest, lockfile
+and existing build configuration are preserved under this assignment's protected-path rule.
+The production audit is clean; six development dependency advisories remain, detailed in the report.
 
-## How to play
+To redeploy independently, upload **the contents of `dist/`** to any static HTTPS host, or pin that
+directory to IPFS and update the existing site's hosting record using its owner's hosting tools.
+No server rewrite is needed: navigation and share state use a single document and URL hashes.
+Vite's `base: "./"` gives relative runtime asset URLs, tested under `/preview/`. The social image's
+absolute metadata URL targets the existing public site; update `og:url` and `og:image` if you use
+another canonical domain. Rebuild after changing metadata. Hosting credentials are never bundled.
 
-1. Pick a part in the parts tray (Straight, Elbow, Alternator, or Remove). Counts show what is left.
-2. Tap or click a floor tile to place it. Tap a placed part to rotate it. The next part of that kind
-   keeps the last rotation you chose.
-3. Press **Start** to run, **Pause** to stop, **Step** to advance exactly one tick, **Reset** to go
-   back to tick 0 with your parts kept. Changing the layout always resets the machine to tick 0.
-4. A board is solved only when the simulation delivers every device's quota within the tick budget.
+## Controls
 
-Keyboard: Tab to the board, arrow keys move between tiles, Enter or Space places or rotates with the
-selected part, R rotates, Delete or Backspace removes. Every tile has a spoken description
-(contents, orientation, alternator's next output, device count, any fault).
+- Select **Straight**, **Elbow** or **Alternator**, then tap an empty floor tile. The tray's count
+  is remaining/total; its preview shows the **next placement's orientation**. Tap a placed part
+  of the selected kind again to rotate it. Its orientation is remembered for the next part.
+- **Remove** returns a part. **Clear all parts** empties the layout. Editing after a tick resets
+  the simulation to tick 0 and keeps the edited layout.
+- **Start / Pause / Resume** controls the clock. **Step** advances one tick. **Reset** keeps the
+  layout and returns to tick 0. A disabled control uses a dashed border and remains unavailable.
+- Switching Workshop / Chain challenge pauses and preserves the current run in this open tab.
+  Selecting the current mode or level does nothing. **Load latest round** explicitly starts a
+  new frozen challenge. Level layouts and earned wins are saved locally when storage works.
+- Keyboard: Tab to one board tile; arrows move; Enter or Space places/rotates; R rotates;
+  Delete or Backspace removes. Every tile describes its ports, next alternator output, quota
+  and fault. Board focus is clamped on board changes.
+- Sound starts **off**. Opt in with **Sound off**; the setting is remembered when storage works.
+  Motion follows the system by default and can be reduced in Workshop notes. Audio failures do
+  not affect play. Storage failures show a persistent warning and use memory for the session.
 
-## Simulation rules
+Fresh tutorial: choose Straight, tap the first dashed tile, tap it again to turn it horizontal,
+then tap the second dashed tile **once**. Press Start. It wins at tick 3. The current instruction
+stays beside the board and the complete six-step checklist remains below it.
 
-The simulation (`src/game/sim.ts`) is a pure function of level, layout and tick count. It has no
-randomness and never reads the clock, so frame rate, animation, sound and network polling cannot
-change an outcome. Rendering interpolates between the previous and current tick positions only.
+## Simulation and levels
 
-Each tick runs in this fixed order:
+`src/game/sim.ts` remains a pure deterministic function. Rendering, sound, saves and feed polling
+never determine ticks. Each 480ms simulation tick emits, moves one tile, routes, checks same-cell
+and head-on collisions, delivers, then evaluates the outcome. A fault ends the run with a location
+and explanation. Maximums: 200 ticks, 32 pulses, 120 log events and 8×8 boards. Animation only
+interpolates already computed movement; reduced motion shows static destinations and counters.
 
-1. **Emission**: if supply remains and `(tick - 1) % interval === 0`, the wheel adds a pulse on its own tile.
-2. **Movement**: every live pulse, in ascending id order, moves one tile along its heading.
-3. **Routing**: in ascending id order, the entered tile decides the pulse's fate. Straight: out the
-   opposite side. Elbow: out the other connected side. Alternator: only accepts its input side, sends
-   the first arrival out of the left of travel and the next out of the right, alternating (state flips
-   in id order). Device: caught if it entered through a socket. Anything else is a fault: off the
-   board, wall, bare floor (no track), a closed side of a part, a device's wrong side, or the wheel housing.
-4. **Collisions**: two pulses on the same track tile, or two pulses swapping tiles through the same
-   edge, are both destroyed. Devices absorb simultaneous arrivals without colliding.
-5. **Delivery**: caught pulses are counted.
-6. **Outcome**: any fault fails the run and is marked on the board with where and why. Otherwise all
-   quotas met wins. Otherwise the run fails when the tick budget runs out or when the supply is spent
-   with no live pulses.
+Every tutorial/level reference solution and all 12 challenge board/tier combinations (three
+chain boards plus one offline board, each at three tiers) run through the real simulation tests.
+The playable offline challenge uses Busy shift. Collision tests seed explicit live-pulse states;
+a closed four-elbow loop with one pulse proves the **exact 200-tick cap**, without pretending a
+source-fed jam is an endless loop.
 
-Bounds (`LIMITS` in `sim.ts`): 200 ticks, 32 pulses, 120 log events, 8x8 boards. `runToEnd` always
-terminates within the budget. Reset rebuilds the initial state, including every alternator.
+## Chain data and honest fallback
 
-"Seed": the handcrafted levels have no seed. A chain challenge's seed is its settlement
-`transactionHash`, which deterministically chooses the board; the offline challenge's seed is
-`offline-1`.
+The browser reads `https://api.squeekchain.com/v1/settlements?range=24h` directly, with an 8s timeout,
+on load, every 60s while visible, and on visibility return. No proxy was introduced.
 
-## Squeekchain integration
+Validation requires `status: available`, Sepolia chain id `11155111`, target `sepolia`, valid decimal
+string fields, a valid 32-byte transaction hash and valid dates. Data generation must be no older
+than two hours. A safe/finalized/confirmed settlement must be at or below the safe block and within
+26 hours of **both** generation and current time. Future generation or settlement dates more than
+**60 seconds** ahead of the current clock (or settlement dates more than 60s ahead of generation)
+are rejected. This small tolerance accommodates clock skew; it is not an allowance for arbitrary
+future data. Freshness is checked again before each new challenge and on visibility return.
 
-`src/game/challenge.ts` reads `GET https://api.squeekchain.com/v1/settlements?range=24h` in the browser
-on load and every 60 seconds while the tab is visible. Only documented public fields are used:
-`status`, `generatedAt`, `chain.chainId`, `chain.target`, `chain.safeThroughBlock`, and per settlement
-`transactionHash`, `settledThroughRound`, `workAdded`, `ethereumBlockNumber`, `blockTimestamp`,
-`confirmationStatus`.
+Hash mapping: `parseInt(hash.slice(-6), 16) % 3` selects Mill row, Bellows or Gearbox. Work selects
+Light (<300: 3 pulses, 2/1 quotas), Busy (300–599: 4 pulses, 2/2), or Rush (600+: 5 pulses, 3/2).
+Work units and workshop pulses are different measures. Pulses are fictional; there are no tokens,
+rewards or mainnet minting. A loaded run never changes when the feed changes or expires.
 
-- Validation: the body must be an object with `status: "available"`, `chain.chainId === "11155111"`
-  and `chain.target === "sepolia"`. Each settlement needs a 32-byte hex hash, decimal-string numbers
-  in range, and a valid timestamp; malformed entries are dropped, never repaired.
-- Selection: the newest settlement whose `confirmationStatus` is `safe` (or `finalized`/`confirmed`),
-  whose block is at or below `safeThroughBlock`, and that is within 26 hours of `generatedAt`. Data
-  generated more than two hours ago counts as stale.
-- Mapping: board = `parseInt(last 6 hex chars of hash) % 3` (Mill row, Bellows, Gearbox). Tier from
-  `workAdded`: under 300 Light shift (3 pulses, quotas 2/1), 300 to 599 Busy shift (4 pulses, 2/2),
-  600+ Rush shift (5 pulses, 3/2). All nine combinations, plus the offline board, are verified
-  solvable by stored reference solutions in `tests/sim.test.ts`.
-- Freezing: pressing Start round N locks the challenge. Later feed updates only show a "newer
-  settlement" card with an explicit Switch button; the active board, seed and quotas never change.
-- Display: round, Sepolia block, work units and the transaction, linked to
-  `https://sepolia.etherscan.io/tx/<hash>` only after the chain id was verified as Sepolia and the hash
-  matched the 32-byte pattern. The UI states that workshop pulses are fictional while the settlement
-  data is real testnet data. No mainnet SQK minting is assumed or shown.
-- Fallback: network error, HTTP error, invalid JSON, wrong chain, stale or empty data, or no safe
-  settlement shows the reason and offers the "Offline workshop challenge", labelled as not linked to
-  any transaction. No transaction data is ever invented.
+If no safe feed is available, **“Offline workshop challenge—authored, not chain-derived”** is
+shown with the failure reason, automatic retry countdown, **Retry now**, and a playable authored
+board. Recovery offers **Load latest round** without disturbing the current run. At phone widths,
+provenance collapses behind **Source & energy details**; full hash, round, block, network, work,
+energy disclosure and the fixed Sepolia Etherscan link remain available there.
 
-## Share links and saved progress
+## Share links and saves
 
-Share links live in the URL hash (`#s=`) with a fixed grammar (`src/game/share.ts`):
+**Copy share link** includes board and layout in `#s=`. Valid links opened in the same tab or after
+reload reproduce the board/seed at tick 0; they never award a claimed solve. Invalid links show an
+error while retaining the current board and simulation. Grammar (`src/game/share.ts`):
 
 ```
 v1~L~<levelId>~<pieces>
-v1~C~<txHash>~<round>~<workAdded>~<ethBlock>~<pieces>
+v1~C~<SepoliaTxHash>~<round>~<workAdded>~<SepoliaBlock>~<pieces>
 v1~O~<pieces>
 ```
 
-`<pieces>` is up to 40 groups of column digit, row digit and a letter `a`-`l` (kind x 4 + rotation).
-Links over 220 characters, with any character outside `A-Z a-z 0-9 ~ -`, unknown levels, or parts that
-break the board or the inventory are rejected with a visible message. Nothing from a link is rendered
-as HTML. The link reopens the same board, seed and layout after reload. A link is never treated as
-proof of a solve. A chain link that was not re-checked says so, and says when it matches the live feed.
+Version 1 chain links are exclusively **Sepolia / 11155111**. Network cannot be changed by a link.
+Hash, work, round, block **and network** must all match a currently fresh, safe validated settlement
+before the UI says the link matches the live feed. Otherwise the share visibly says unverified;
+round/block/work are explicitly labeled as claims. An explorer link alone never verifies a claim.
 
-Local save (`src/game/storage.ts`, key `wheelworks.save`, `version: 1`) keeps solved levels (best
-tick), the last layout per handcrafted level, the last level, and settings (mute, motion). It is
-validated field by field on load; anything invalid falls back to defaults.
+Pieces use three characters each (column digit, row digit, letter a–l for kind/rotation). The parser
+bounds length, characters, coordinates and inventory; it never renders link data as HTML.
 
-## Known limitations
+`wheelworks.save` version 1 retains best winning tick, validated level layouts, last level, mute
+and motion settings. Valid existing saves are read field by field. Both access to `localStorage`
+and its methods are guarded. If reading fails the old save is left alone; if writing fails a
+warning states that memory progress/settings will be lost on closing the page. Current-session
+mode simulations are held in memory; reload restores layouts and earned wins, not an active tick.
 
-- No deployed URL from this worker: the publisher pins `dist/` after the job (see Delivery).
-- `og:image` is a relative URL (`./og.png`) because the final host is unknown; some link unfurlers
-  require an absolute URL.
-- The font stack starts with `ui-rounded` (SF Pro Rounded on Apple devices); other systems use their
-  system sans-serif. No web font ships.
-- Manual checks on physical phones were not possible here; touch was exercised with Playwright's
-  touch emulation (`hasTouch`, `isMobile`) at 390 px. See `TEST_REPORT.md`.
+## Verification and project files
+
+- [TEST_REPORT.md](TEST_REPORT.md): commands, actual outcomes, screenshots, design review and limits.
+- [DESIGN.md](DESIGN.md): implemented tokens, typography, workbench components and responsive rules.
+- [ASSETS.md](ASSETS.md) and [LICENSE](LICENSE): code/art provenance and licensing.
+- `tests/*.test.ts`: simulator, solutions, feed, shares, storage and audio checks.
+- `tests/browser-check.mjs`: repeatable browser-driven production/export and previous-live-site checks.
+
+Optional browser checks need Playwright, installed outside the delivered app. For example:
+
+```sh
+npm install --prefix test/scratch/browser playwright@1.58.2
+PLAYWRIGHT_BROWSERS_PATH=/tmp/wheelworks-browsers node test/scratch/browser/node_modules/playwright/cli.js install chromium firefox webkit
+PLAYWRIGHT_BROWSERS_PATH=/tmp/wheelworks-browsers node tests/browser-check.mjs /absolute/path/to/test/scratch/browser/node_modules/playwright/index.mjs
+```
+
+To regenerate the original social card after changing the art, run
+`node scripts/render-social.mjs <absolute-path-to-playwright/index.mjs>` with the same
+`PLAYWRIGHT_BROWSERS_PATH`, then rebuild to copy `public/og.png` into `dist/`.
+
+The browser-check script creates and closes its own preview server, exercises UI input, and writes evidence to
+`artifacts/`. It explicitly distinguishes synthetic feed fixtures from the real public feed.
+Physical-device, screen-reader and native browser zoom checks remain separate manual work.

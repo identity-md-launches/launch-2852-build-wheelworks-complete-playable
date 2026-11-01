@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import fixture from "./fixture-settlements.json";
-import { API_URL, CHALLENGE_BOARDS, challengeFromSettlement, explorerUrl, loadFeed, parseSettlements, pickSettlement, tierForWork } from "../src/game/challenge";
+import { API_URL, CHALLENGE_BOARDS, challengeFromSettlement, explorerUrl, loadFeed, parseSettlements, pickSettlement, tierForWork, CLOCK_TOLERANCE_MS, MAX_DATA_AGE_MS, recheckFeed, settlementMatches } from "../src/game/challenge";
 
 const NOW = Date.parse(fixture.generatedAt) + 60_000;
 const res = (body: unknown, status = 200) => new Response(typeof body === "string" ? body : JSON.stringify(body), { status });
@@ -54,6 +54,8 @@ describe("settlement feed", () => {
     const p = parseSettlements(junk);
     expect(p.ok && p.data.settlements.length).toBe(0);
     expect(parseSettlements([]).ok).toBe(false);
+    expect(parseSettlements({ ...fixture, generatedAt: "2026-02-31T00:00:00Z" }).ok).toBe(false);
+    expect(parseSettlements({ ...fixture, generatedAt: "2026-11-01" }).ok).toBe(false);
     expect(parseSettlements({ ...fixture, status: "degraded" }).ok).toBe(false);
   });
   it("pickSettlement ignores settlements older than the 24h window", () => {
@@ -61,6 +63,32 @@ describe("settlement feed", () => {
     if (!p.ok) throw new Error();
     const old = { ...p.data, settlements: p.data.settlements.map((s) => ({ ...s, blockTimestamp: "2020-01-01T00:00:00.000Z" })) };
     expect(pickSettlement(old, NOW).ok).toBe(false);
+  });
+  it("rejects future feed and settlement timestamps, invalid dates, and permits only 60s clock skew", async () => {
+    const gen = new Date(NOW + CLOCK_TOLERANCE_MS + 1).toISOString();
+    expect((await loadFeed(fetchOf(res({ ...fixture, generatedAt: gen })), () => NOW)).status).toBe("unavailable");
+    const future = { ...fixture, recentSettlements: fixture.recentSettlements.map((s) => ({ ...s, blockTimestamp: new Date(NOW + 120_000).toISOString() })) };
+    expect((await loadFeed(fetchOf(res(future)), () => NOW)).status).toBe("unavailable");
+    expect((await loadFeed(fetchOf(res({ ...fixture, generatedAt: "invalid" })), () => NOW)).status).toBe("unavailable");
+    const boundary = { ...fixture, generatedAt: new Date(NOW + CLOCK_TOLERANCE_MS).toISOString() };
+    expect((await loadFeed(fetchOf(res(boundary)), () => NOW)).status).toBe("ready");
+    const invalid = { ...fixture, recentSettlements: fixture.recentSettlements.map((s) => ({ ...s, blockTimestamp: "invalid" })) };
+    expect((await loadFeed(fetchOf(res(invalid)), () => NOW)).status).toBe("unavailable");
+  });
+  it("rechecks cached freshness and verifies every claimed field, including the network and safe status", async () => {
+    const feed = await loadFeed(fetchOf(res(fixture)), () => NOW);
+    if (feed.status !== "ready") throw new Error("fixture failed");
+    const { snapshot, settlement: s } = feed;
+    expect(settlementMatches(snapshot, s, NOW)).toBe(true);
+    for (const patch of [{ settledThroughRound: 999999999999 }, { ethereumBlockNumber: 1 }, { workAdded: s.workAdded + 1 }, { transactionHash: "0x" + "f".repeat(64) }]) {
+      expect(settlementMatches(snapshot, { ...s, ...patch }, NOW)).toBe(false);
+    }
+    expect(settlementMatches({ ...snapshot, network: "Mainnet" }, s, NOW)).toBe(false);
+    expect(settlementMatches({ ...snapshot, chainId: "1" }, s, NOW)).toBe(false);
+    expect(settlementMatches({ ...snapshot, safeThroughBlock: 1 }, s, NOW)).toBe(false);
+    expect(settlementMatches(snapshot, s, NOW + MAX_DATA_AGE_MS)).toBe(false);
+    expect(recheckFeed(feed, NOW + MAX_DATA_AGE_MS).status).toBe("unavailable");
+    expect(recheckFeed(feed, NOW).status).toBe("ready");
   });
   it("uses the documented endpoint", () => {
     expect(API_URL).toBe("https://api.squeekchain.com/v1/settlements?range=24h");
